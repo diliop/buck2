@@ -96,6 +96,7 @@ jobs:
           name: Build buck2 binary (release)
           command: |
             mkdir /tmp/artifacts
+            sed -i 's/2023-04-23/2023-04-20/g' ./rust-toolchain
             cargo build --bin=buck2 --release -Z unstable-options --out-dir=/tmp/artifacts
       - run:
           name: Build example/prelude directory
