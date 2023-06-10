@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - nightly-version-tests
 
 jobs:
   get_prelude_hash:
