@@ -1,6 +1,6 @@
 [toolchain]
 # Rustc version is read by `app/buck2_core/build.rs`. Update it when updating the channel below.
-# @rustc_version: rustc 1.71.0-nightly (c609da59d 2023-04-18)
-channel = "nightly-2023-04-19"
+# @rustc_version: rustc 1.71.0-nightly (cca7ee581 2023-05-27)
+channel = "nightly-2023-05-28"
 components = ["llvm-tools-preview","rustc-dev","rust-src"]
 
