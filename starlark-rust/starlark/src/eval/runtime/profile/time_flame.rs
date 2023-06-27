@@ -1,352 +1,476 @@
 /*
- * Copyright 2019 The Starlark in Rust Authors.
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     https://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * This source code is licensed under both the MIT license found in the
+ * LICENSE-MIT file in the root directory of this source tree and the Apache
+ * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+ * of this source tree.
  */
 
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
-use std::slice;
-use std::time::Instant;
+//! The future that is spawned, but has various more strict cancellation behaviour than
+//! tokio's JoinHandle
+//!
 
-use dupe::Dupe;
-use starlark_map::StarlarkHasherBuilder;
+use std::any::Any;
+use std::pin::Pin;
+use std::task::Context;
+use std::task::Poll;
 
-use crate as starlark;
-use crate::eval::runtime::profile::data::ProfileData;
-use crate::eval::runtime::profile::data::ProfileDataImpl;
-use crate::eval::runtime::profile::flamegraph::FlameGraphData;
-use crate::eval::runtime::profile::flamegraph::FlameGraphNode;
-use crate::eval::runtime::small_duration::SmallDuration;
-use crate::eval::ProfileMode;
-use crate::slice_vec_ext::SliceExt;
-use crate::values::layout::heap::profile::arc_str::ArcStr;
-use crate::values::layout::pointer::RawPointer;
-use crate::values::FrozenValue;
-use crate::values::Trace;
-use crate::values::Tracer;
-use crate::values::Value;
+use allocative::Allocative;
+use futures::future::BoxFuture;
+use futures::future::Future;
+use futures::FutureExt;
+use pin_project::pin_project;
+use pin_project::pinned_drop;
+use thiserror::Error;
+use tracing::Instrument;
+use tracing::Span;
 
-#[derive(Debug, thiserror::Error)]
-enum FlameProfileError {
-    #[error("Flame profile not enabled")]
-    NotEnabled,
+use crate::cancellable_future::CancellableFuture;
+use crate::cancellable_future::StrongRefCount;
+use crate::cancellable_future::WeakRefCount;
+use crate::cancellation::future::make_cancellable_future;
+use crate::cancellation::future::CancellationHandle;
+use crate::cancellation::ExplicitCancellationContext;
+use crate::instrumented_shared::SharedEvents;
+use crate::instrumented_shared::SharedEventsFuture;
+use crate::spawner::Spawner;
+
+#[derive(Debug, Error, Copy, Clone, PartialEq)]
+pub enum WeakFutureError {
+    #[error("Join Error")]
+    JoinError,
+
+    #[error("Cancelled")]
+    Cancelled,
 }
 
-#[derive(Hash, PartialEq, Eq, Clone, Copy, Dupe)]
-struct MutableValueId(usize);
-#[derive(Hash, PartialEq, Eq, Clone, Copy, Dupe)]
-struct FrozenValueId(usize);
-
-/// Index into FlameData.values
-#[derive(Hash, PartialEq, Eq, Clone, Copy, Dupe)]
-enum ValueId {
-    // This struct is two words, can be made one.
-    Mutable(MutableValueId),
-    Frozen(FrozenValueId),
+/// A unit of computation within Dice. Futures to the result of this computation should be obtained
+/// via this task struct
+#[derive(Allocative)]
+pub struct WeakJoinHandle<T: Clone> {
+    #[allocative(skip)] // TODO(nga): `Shared` requires `Clone`.
+    join_handle: SharedEventsFuture<BoxFuture<'static, T>>,
+    #[allocative(skip)]
+    guard: WeakRefCount,
 }
 
-impl ValueId {
-    fn lookup<'a, T>(self, mutable: &'a [T], frozen: &'a [T]) -> &'a T {
-        match self {
-            ValueId::Mutable(x) => &mutable[x.0],
-            ValueId::Frozen(x) => &frozen[x.0],
+impl<T: Send + Sync + Clone + 'static> WeakJoinHandle<T> {
+    /// Return `None` if the task has been canceled.
+    pub fn pollable(&self) -> Option<StrongJoinHandle<SharedEventsFuture<BoxFuture<'static, T>>>> {
+        self.guard.upgrade().map(|inner| StrongJoinHandle {
+            guard: inner,
+            fut: self.join_handle.clone(),
+        })
+    }
+}
+
+impl<T: Send + Sync + Clone + 'static> WeakJoinHandle<Result<T, WeakFutureError>> {
+    pub fn into_completion_observer(self) -> CompletionObserver<T> {
+        CompletionObserver { inner: self }
+    }
+}
+
+/// The actual pollable future that returns the result of the task. This keeps the future alive.
+#[pin_project]
+pub struct StrongJoinHandle<F> {
+    guard: StrongRefCount,
+    #[pin]
+    fut: F,
+}
+
+impl<F> StrongJoinHandle<F> {
+    fn map<F2>(self, map: impl FnOnce(F) -> F2) -> StrongJoinHandle<F2> {
+        StrongJoinHandle {
+            guard: self.guard,
+            fut: map(self.fut),
         }
     }
 }
 
-/// Bimap between `Value` and `ValueId`.
-/// In order to optimise GC (which otherwise quickly becomes O(n^2)) we have to
-/// dedupe the values, so store them in `values`, with a fast map to get them in `map`.
-/// Whenever we GC, regenerate map.
-#[derive(Default)]
-struct ValueIndex<'v> {
-    /// Map from `MutableValueId` to `Value`.
-    mutable_values: Vec<Value<'v>>,
-    /// Map from `FrozenValueId` to `Value`.
-    frozen_values: Vec<FrozenValue>,
-    /// Map from `Value` to `MutableValueId`.
-    mutable_map: HashMap<RawPointer, MutableValueId, StarlarkHasherBuilder>,
-    /// Map from `Value` to `FrozenValueId`.
-    frozen_map: HashMap<RawPointer, FrozenValueId, StarlarkHasherBuilder>,
-}
-
-unsafe impl<'v> Trace<'v> for ValueIndex<'v> {
-    fn trace(&mut self, tracer: &Tracer<'v>) {
-        // We only need to trace mutable values.
-        self.mutable_values.trace(tracer);
-        // Have to rebuild the map, as its keyed by ValuePtr which changes on GC
-        self.mutable_map.clear();
-        for (i, x) in self.mutable_values.iter().enumerate() {
-            self.mutable_map.insert(x.ptr_value(), MutableValueId(i));
+impl<T> StrongJoinHandle<SharedEventsFuture<BoxFuture<'static, T>>>
+where
+    T: Clone,
+{
+    fn weak_handle(&self) -> WeakJoinHandle<T> {
+        WeakJoinHandle {
+            join_handle: self.fut.clone(),
+            guard: self.guard.downgrade(),
         }
     }
 }
 
-impl<'v> ValueIndex<'v> {
-    /// Map `Value` to `ValueId`.
-    fn index(&mut self, value: Value<'v>) -> ValueId {
-        match value.unpack_frozen() {
-            Some(frozen) => match self.frozen_map.entry(frozen.ptr_value()) {
-                Entry::Occupied(e) => ValueId::Frozen(*e.get()),
-                Entry::Vacant(e) => {
-                    let res = FrozenValueId(self.frozen_values.len());
-                    self.frozen_values.push(frozen);
-                    e.insert(res);
-                    ValueId::Frozen(res)
-                }
-            },
-            None => match self.mutable_map.entry(value.ptr_value()) {
-                Entry::Occupied(e) => ValueId::Mutable(*e.get()),
-                Entry::Vacant(e) => {
-                    let res = MutableValueId(self.mutable_values.len());
-                    self.mutable_values.push(value);
-                    e.insert(res);
-                    ValueId::Mutable(res)
-                }
-            },
-        }
+impl<F: Future> StrongJoinHandle<F> {
+    pub fn inner(&self) -> &F {
+        &self.fut
     }
 }
 
-enum Frame {
-    /// Entry recorded when we enter a function.
-    Push(ValueId),
-    /// Entry recorded when we exit a function.
-    Pop,
-}
+impl<F, T> Future for StrongJoinHandle<F>
+where
+    F: Future<Output = Result<T, WeakFutureError>>,
+{
+    type Output = T;
 
-#[derive(Trace)]
-pub(crate) struct TimeFlameProfile<'v>(
-    /// `Some` means enabled.
-    Option<Box<FlameData<'v>>>,
-);
-
-#[derive(Default, Trace)]
-struct FlameData<'v> {
-    /// All events in the profile, i.e. function entry or exit with timestamp.
-    frames: Vec<(Frame, Instant)>,
-    index: ValueIndex<'v>,
-}
-
-struct Stacks<'a> {
-    name: &'a str,
-    time: SmallDuration,
-    children: HashMap<ValueId, Stacks<'a>, StarlarkHasherBuilder>,
-}
-
-impl<'a> Stacks<'a> {
-    fn blank(name: &'a str) -> Self {
-        Stacks {
-            name,
-            time: SmallDuration::default(),
-            children: HashMap::with_hasher(StarlarkHasherBuilder),
-        }
-    }
-
-    fn new(
-        mutable_names: &'a [String],
-        frozen_names: &'a [String],
-        frames: &[(Frame, Instant)],
-    ) -> Self {
-        let mut res = Stacks::blank("root");
-        let Some(mut last_time) = frames.first().map(|x| x.1) else {
-            return res;
-        };
-        res.add(
-            mutable_names,
-            frozen_names,
-            &mut frames.iter(),
-            &mut last_time,
-        );
-        res
-    }
-
-    fn add(
-        &mut self,
-        mutable_names: &'a [String],
-        frozen_names: &'a [String],
-        frames: &mut slice::Iter<(Frame, Instant)>,
-        last_time: &mut Instant,
-    ) {
-        while let Some((frame, time)) = frames.next() {
-            self.time += time.duration_since(*last_time);
-            *last_time = *time;
-            match frame {
-                Frame::Pop => return,
-                Frame::Push(i) => match self.children.entry(*i) {
-                    Entry::Occupied(mut e) => {
-                        e.get_mut()
-                            .add(mutable_names, frozen_names, frames, last_time)
-                    }
-                    Entry::Vacant(e) => e
-                        .insert(Stacks::blank(
-                            i.lookup(mutable_names, frozen_names).as_str(),
-                        ))
-                        .add(mutable_names, frozen_names, frames, last_time),
-                },
-            }
-        }
-    }
-
-    fn render_with_buffer(&self, node: &mut FlameGraphNode) {
-        let node = node.child(ArcStr::from(self.name));
-        let count = self.time.to_duration().as_millis();
-        if count > 0 {
-            node.add(count as u64);
-        }
-        for x in self.children.values() {
-            x.render_with_buffer(node);
-        }
-    }
-
-    fn render(&self) -> FlameGraphData {
-        let mut data = FlameGraphData::default();
-        self.render_with_buffer(data.root());
-        data
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // When we have a StrongJoinHandle, we expect the future to not have been cancelled.
+        let this = self.project();
+        this.fut.poll(cx).map(|r| r.unwrap())
     }
 }
 
-impl<'v> TimeFlameProfile<'v> {
-    pub(crate) fn new() -> Self {
-        Self(None)
-    }
+#[pin_project]
+pub struct CompletionObserver<T: Clone> {
+    inner: WeakJoinHandle<Result<T, WeakFutureError>>,
+}
 
-    pub(crate) fn enable(&mut self) {
-        self.0 = Some(Box::default());
-    }
+impl<T: Clone> Future for CompletionObserver<T> {
+    type Output = ();
 
-    pub(crate) fn record_call_enter(&mut self, function: Value<'v>) {
-        if let Some(x) = &mut self.0 {
-            let ind = x.index.index(function);
-            x.frames.push((Frame::Push(ind), Instant::now()))
-        }
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        this.inner.join_handle.poll_unpin(cx).map(|_res| ())
     }
+}
 
-    pub(crate) fn record_call_exit(&mut self) {
-        if let Some(x) = &mut self.0 {
-            x.frames.push((Frame::Pop, Instant::now()))
-        }
+/// Spawn a cancellable future. The preamble is a non-cancellable portion that can come before.
+pub fn spawn_dropcancel_with_preamble<T, S, P>(
+    future: T,
+    preamble: P,
+    spawner: &dyn Spawner<S>,
+    ctx: &S,
+    span: Span,
+) -> (
+    WeakJoinHandle<Result<T::Output, WeakFutureError>>,
+    StrongJoinHandle<SharedEventsFuture<BoxFuture<'static, Result<T::Output, WeakFutureError>>>>,
+)
+where
+    T: Future + Send + 'static,
+    T::Output: Any + Clone + Send + 'static,
+    P: Future<Output = ()> + Send + 'static,
+{
+    let strong = spawn_inner(future, preamble, spawner, ctx, span).map(|f| f.instrumented_shared());
+    (strong.weak_handle(), strong)
+}
+
+/// Spawn a cancellable future. The preamble is a non-cancellable portion that can come before.
+fn spawn_inner<T, S, P>(
+    future: T,
+    preamble: P,
+    spawner: &dyn Spawner<S>,
+    ctx: &S,
+    span: Span,
+) -> StrongJoinHandle<BoxFuture<'static, Result<T::Output, WeakFutureError>>>
+where
+    T: Future + Send + 'static,
+    T::Output: Any + Send + 'static,
+    P: Future<Output = ()> + Send + 'static,
+{
+    // For Ready<()> and BoxFuture<()> futures we get these sizes:
+    // future alone: 196/320 bits
+    // future + no-op preamble via async block: 448/704 bits
+    // future + no-op preamble via FuturesExt::then: 256/384 bits
+    // future + no-op preamble + instrument: 512/640 bits
+
+    // As the spawner is going to take a boxed future and erase its concrete type,
+    // we can have different future types for different scenarios in order to
+    // minimize the size of them.
+    //
+    // While we could feasibly distinguish the no-op preamble case, one extra pointer
+    // is an okay cost for the simpler api (for now).
+    let (future, guard) = CancellableFuture::new_refcounted(future);
+    let future = future.map(|v| Box::new(v) as _);
+    let future = preamble.then(|_| future);
+    let future = if span.is_disabled() {
+        future.boxed()
+    } else {
+        future.instrument(span).boxed()
+    };
+
+    let task = spawner.spawn(ctx, future.boxed());
+    let task = task
+        .map(|v| {
+            v.map_err(|_e: tokio::task::JoinError| WeakFutureError::JoinError)?
+                .downcast::<Option<T::Output>>()
+                .expect("Spawned task returned the wrong type")
+                .ok_or(WeakFutureError::Cancelled)
+        })
+        .boxed();
+
+    StrongJoinHandle { guard, fut: task }
+}
+
+/// Spawn a cancellable future.
+pub fn spawn_dropcancel<T, S>(
+    future: T,
+    spawner: &dyn Spawner<S>,
+    ctx: &S,
+    span: Span,
+) -> StrongJoinHandle<BoxFuture<'static, Result<T::Output, WeakFutureError>>>
+where
+    T: Future + Send + 'static,
+    T::Output: Any + Send + 'static,
+{
+    spawn_inner(future, futures::future::ready(()), spawner, ctx, span)
+}
+
+pub struct FutureAndCancellationHandle<T> {
+    pub future: CancellableJoinHandle<T>,
+    pub cancellation_handle: CancellationHandle,
+}
+
+impl<T> FutureAndCancellationHandle<T> {
+    pub fn into_drop_cancel(self) -> DropCancelFuture<T> {
+        self.future.into_drop_cancel(self.cancellation_handle)
     }
+}
 
-    // We could expose profile on the Heap, but it's an implementation detail that it works here.
-    pub(crate) fn gen(&self) -> anyhow::Result<ProfileData> {
-        match &self.0 {
-            None => Err(FlameProfileError::NotEnabled.into()),
-            Some(x) => Ok(Self::gen_profile(x)),
-        }
+/// Spawn a future that's cancellable via an CancellationHandle. Dropping the future or the handle
+/// does not cancel the future
+pub fn spawn_cancellable<F, T, S>(
+    f: F,
+    spawner: &dyn Spawner<S>,
+    ctx: &S,
+) -> FutureAndCancellationHandle<T>
+where
+    for<'a> F: FnOnce(&'a ExplicitCancellationContext) -> BoxFuture<'a, T> + Send,
+    T: Any + Send + 'static,
+{
+    let (future, cancellation_handle) = make_cancellable_future(f);
+
+    // For Ready<()> and BoxFuture<()> futures we get these sizes:
+    // future alone: 196/320 bits
+    // future via async block: 448/704 bits
+
+    // As the spawner is going to take a boxed future and erase its concrete type,
+    // we can have different future types for different scenarios in order to
+    // minimize the size of them.
+    //
+    // While we could feasibly distinguish the no-op preamble case, one extra pointer
+    // is an okay cost for the simpler api (for now).
+    let future = future.map(|v| Box::new(v) as _);
+
+    let task = spawner.spawn(ctx, future.boxed());
+    let task = task
+        .map(|v| {
+            v.map_err(|_e: tokio::task::JoinError| WeakFutureError::JoinError)?
+                .downcast::<Option<T>>()
+                .expect("Spawned task returned the wrong type")
+                .ok_or(WeakFutureError::Cancelled)
+        })
+        .boxed();
+
+    FutureAndCancellationHandle {
+        future: CancellableJoinHandle(task),
+        cancellation_handle,
     }
+}
 
-    fn gen_profile(x: &FlameData) -> ProfileData {
-        // Need to write out lines which look like:
-        // root;calls1;calls2 1
-        // All the numbers at the end must be whole numbers (we use milliseconds)
-        let mutable_names = x.index.mutable_values.map(|x| x.to_repr());
-        let frozen_names = x.index.frozen_values.map(|x| x.to_value().to_repr());
-        ProfileData {
-            profile_mode: ProfileMode::TimeFlame,
-            profile: ProfileDataImpl::TimeFlameProfile(
-                Stacks::new(&mutable_names, &frozen_names, &x.frames).render(),
-            ),
+#[pin_project]
+pub struct CancellableJoinHandle<T>(#[pin] BoxFuture<'static, Result<T, WeakFutureError>>);
+
+impl<T> Future for CancellableJoinHandle<T> {
+    type Output = Result<T, WeakFutureError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.project().0.poll(cx)
+    }
+}
+
+#[pin_project(PinnedDrop)]
+pub struct DropCancelFuture<T> {
+    #[pin]
+    fut: BoxFuture<'static, Result<T, WeakFutureError>>,
+    cancellation_handle: Option<CancellationHandle>,
+}
+
+impl<T> Future for DropCancelFuture<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.project().fut.poll(cx).map(|r| {
+            // since the lifetime of this future is responsible for cancellation, this future can't
+            // possibly have been canceled.
+            // We can only have join errors, which is when the executor shuts down. To be consistent
+            // with existing spawn behaviour, we can ignore that.
+            r.unwrap()
+        })
+    }
+}
+
+#[pinned_drop]
+impl<T> PinnedDrop for DropCancelFuture<T> {
+    fn drop(mut self: Pin<&mut Self>) {
+        // ignore the termination future of when we actually shutdown. The creator of this
+        // DropCancelFuture has the termination future as well that it can use to observe termination
+        // if it cares
+        let _cancel = self
+            .cancellation_handle
+            .take()
+            .expect("dropped twice")
+            .cancel();
+    }
+}
+
+impl<T> CancellableJoinHandle<T> {
+    fn into_drop_cancel(self, cancellation_handle: CancellationHandle) -> DropCancelFuture<T> {
+        DropCancelFuture {
+            fut: self.0,
+            cancellation_handle: Some(cancellation_handle),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::thread;
-    use std::time::Duration;
+    use std::sync::Arc;
 
-    use anyhow::Context;
-    use starlark_derive::starlark_module;
+    use tokio::sync::oneshot;
 
-    use crate as starlark;
-    use crate::assert::Assert;
-    use crate::environment::Globals;
-    use crate::environment::GlobalsBuilder;
-    use crate::environment::Module;
-    use crate::eval::runtime::file_loader::ReturnOwnedFileLoader;
-    use crate::eval::Evaluator;
-    use crate::eval::ProfileMode;
-    use crate::syntax::AstModule;
-    use crate::syntax::Dialect;
-    use crate::values::none::NoneType;
+    use super::*;
+    use crate::spawner::TokioSpawner;
 
-    #[test]
-    fn test_time_flame_works_inside_frozen_module() {
-        #[starlark_module]
-        fn register_sleep(globals: &mut GlobalsBuilder) {
-            fn sleep() -> anyhow::Result<NoneType> {
-                thread::sleep(Duration::from_millis(2));
-                Ok(NoneType)
-            }
-        }
+    #[derive(Default)]
+    struct MockCtx;
 
-        let mut a = Assert::new();
-        a.globals_add(register_sleep);
-        let a_bzl = a.pass_module(
-            r#"
-def foo():
-    for i in range(5):
-        # Must sleep otherwise time flame will round the duration to zero and erase it.
-        sleep()
-    "#,
+    #[tokio::test]
+    async fn test_cancellation() {
+        let (release_task, recv_release_task) = oneshot::channel();
+        let (notify_success, recv_success) = oneshot::channel();
+
+        let sp = Arc::new(TokioSpawner);
+
+        let (_task, poll) = spawn_dropcancel_with_preamble(
+            async move {
+                recv_release_task.await.unwrap();
+                notify_success.send(()).unwrap();
+            },
+            futures::future::ready(()),
+            sp.as_ref(),
+            &MockCtx,
+            tracing::debug_span!("test"),
         );
 
-        let modules = HashMap::from_iter([("a.bzl".to_owned(), a_bzl)]);
-        let loader = ReturnOwnedFileLoader { modules };
+        // Throw away the strong handle.
+        drop(poll);
 
-        let module = Module::new();
-        let mut eval = Evaluator::new(&module);
-        eval.enable_profile(&ProfileMode::TimeFlame).unwrap();
-        eval.set_loader(&loader);
-        eval.eval_module(
-            AstModule::parse(
-                "x.star",
-                r#"
-load("a.bzl", "foo")
+        // Now, release the task. In all likelihood it will have already exited, but
+        let _ignored = release_task.send(());
 
-def bar():
-    for i in range(10):
-        foo()
+        // The task should never get to sending in notify_success since all its referenced had been
+        // dropped at that point, but it *should* drop the channel itself.
+        recv_success.await.unwrap_err();
+    }
 
-bar()
-"#
-                .to_owned(),
-                &Dialect::Standard,
-            )
-            .unwrap(),
-            &Globals::standard(),
-        )
-        .unwrap();
+    #[tokio::test]
+    async fn test_spawn() {
+        let sp = Arc::new(TokioSpawner);
+        let fut = async { "Hello world!" };
 
-        let profile = eval.gen_profile().unwrap().gen().unwrap();
-        let the_line = profile
-            .lines()
-            .find(|l| l.contains("foo"))
-            .with_context(|| {
-                format!(
-                    "There must be a line with `foo` in the profile: {:?}",
-                    profile
-                )
-            })
-            .unwrap();
-        assert!(
-            the_line.contains("bar"),
-            "Profile must contain a line `bar.*foo`: {:?}",
-            profile
+        let (_task, poll) = spawn_dropcancel_with_preamble(
+            fut,
+            futures::future::ready(()),
+            sp.as_ref(),
+            &MockCtx,
+            tracing::debug_span!("test"),
         );
+
+        let res = poll.await;
+        assert_eq!(res, "Hello world!");
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_of_cancellable() {
+        let (release_task, recv_release_task) = oneshot::channel();
+        let (notify_success, recv_success) = oneshot::channel();
+
+        let sp = Arc::new(TokioSpawner);
+
+        let FutureAndCancellationHandle {
+            cancellation_handle,
+            ..
+        } = spawn_cancellable(
+            move |_| {
+                async move {
+                    recv_release_task.await.unwrap();
+                    notify_success.send(()).unwrap();
+                }
+                .boxed()
+            },
+            sp.as_ref(),
+            &MockCtx,
+        );
+
+        // Trigger cancellation
+        cancellation_handle.cancel();
+
+        // Now, release the task. In all likelihood it will have already exited, but
+        let _ignored = release_task.send(());
+
+        // The task should never get to sending in notify_success since cancellation was trigger,
+        // but it *should* drop the channel itself.
+        recv_success.await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_of_cancellable_convert_dropcancel() {
+        let (release_task, recv_release_task) = oneshot::channel();
+        let (notify_success, recv_success) = oneshot::channel();
+
+        let sp = Arc::new(TokioSpawner);
+
+        let FutureAndCancellationHandle {
+            future: task,
+            cancellation_handle,
+        } = spawn_cancellable(
+            move |_| {
+                async move {
+                    recv_release_task.await.unwrap();
+                    notify_success.send(()).unwrap();
+                }
+                .boxed()
+            },
+            sp.as_ref(),
+            &MockCtx,
+        );
+
+        let future = task.into_drop_cancel(cancellation_handle);
+
+        drop(future);
+
+        // Now, release the task. In all likelihood it will have already exited, but
+        let _ignored = release_task.send(());
+
+        // The task should never get to sending in notify_success since all its referenced had been
+        // dropped at that point, but it *should* drop the channel itself.
+        recv_success.await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn test_spawn_cancellable() {
+        let sp = Arc::new(TokioSpawner);
+        let fut = async { "Hello world!" }.boxed();
+
+        let FutureAndCancellationHandle { future: task, .. } =
+            spawn_cancellable(|_| fut, sp.as_ref(), &MockCtx);
+
+        let res = task.await;
+        assert_eq!(res, Ok("Hello world!"));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_cancellable_convert_to_dropcancel() {
+        let sp = Arc::new(TokioSpawner);
+        let fut = async { "Hello world!" }.boxed();
+
+        let FutureAndCancellationHandle {
+            future: task,
+            cancellation_handle,
+        } = spawn_cancellable(|_| fut, sp.as_ref(), &MockCtx);
+
+        let future = task.into_drop_cancel(cancellation_handle);
+
+        let res = future.await;
+        assert_eq!(res, "Hello world!");
     }
 }
